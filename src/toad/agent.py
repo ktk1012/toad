@@ -19,6 +19,22 @@ class AgentFail(Message):
     help: str = "fail"
 
 
+@dataclass
+class AgentReconnecting(Message):
+    """Agent transport was disconnected and a reconnect attempt is in flight."""
+
+    attempt: int
+    max_attempts: int
+    delay: float
+
+
+@dataclass
+class AgentReconnected(Message):
+    """Agent transport was re-established and the session was resumed."""
+
+    attempt: int
+
+
 class AgentBase(ABC):
     """Base class for an 'agent'."""
 

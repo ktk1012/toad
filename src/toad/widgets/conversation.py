@@ -1057,10 +1057,73 @@ class Conversation(containers.Vertical):
         with suppress(NoMatches):
             self.query_one(f"#{block_id}").focus()
 
+    async def _confirm_remote_terminal(
+        self,
+        command: str,
+        args: list[str] | None,
+        cwd: str | None,
+    ) -> bool:
+        """Ask the user to approve a terminal command from a remote agent.
+
+        Returns True if the user selects an "allow" option, False otherwise.
+        Only invoked for agents whose transport is not trusted-local (stdio).
+        """
+        import shlex
+
+        display_command = (
+            shlex.join([command, *args]) if args else command
+        )
+        cwd_display = cwd or str(self.project_path)
+        title = (
+            f"Remote agent wants to run a shell command"
+            f"\n    {display_command}"
+            f"\n    (cwd: {cwd_display})"
+        )
+
+        options = [
+            Answer("Allow", "allow", "allow_once"),
+            Answer("Reject", "reject", "reject_once"),
+        ]
+
+        result_future: Future[Answer] = asyncio.get_running_loop().create_future()
+
+        def callback(answer: Answer) -> None:
+            if not result_future.done():
+                result_future.set_result(answer)
+            if not self.prompt.ask_queue:
+                self.post_message(messages.SessionUpdate(state="busy"))
+
+        self.post_message(messages.SessionUpdate(state="asking"))
+        self.app.terminal_alert()
+        self.app.system_notify(
+            display_command,
+            title=f"[{self.agent_title or 'Agent'}] Shell command requested",
+            sound="question",
+        )
+        self.ask(options, title, callback=callback)
+
+        result = await result_future
+        self.app.terminal_alert(False)
+        return (result.kind or "").startswith("allow")
+
     @work
     @on(acp_messages.CreateTerminal)
     async def on_acp_create_terminal(self, message: acp_messages.CreateTerminal):
         from toad.widgets.terminal_tool import TerminalTool, Command
+
+        # Security gate: remote (non-stdio) agents must get explicit user
+        # consent before executing arbitrary shell commands. Local stdio
+        # agents retain the existing behaviour — they are launched by the
+        # user from a binary on their own machine and are considered
+        # trusted to the same degree as the user's own process.
+        transport_kind = getattr(self.agent, "transport_kind", "stdio")
+        if transport_kind != "stdio":
+            allowed = await self._confirm_remote_terminal(
+                message.command, message.args, message.cwd
+            )
+            if not allowed:
+                message.result_future.set_result(False)
+                return
 
         command = Command(
             message.command,
