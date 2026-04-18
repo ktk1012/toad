@@ -1,4 +1,5 @@
 import asyncio
+import weakref
 
 from contextlib import suppress
 from datetime import datetime
@@ -177,6 +178,9 @@ class Agent(AgentBase):
         self._task: asyncio.Task | None = None
         self._transport: Transport | None = None
         self._stopping: bool = False
+        # Track id-bearing MethodCalls so we can fail their futures on
+        # transport loss. WeakSet so completed calls drop out automatically.
+        self._pending_calls: weakref.WeakSet[jsonrpc.MethodCall] = weakref.WeakSet()
         self.done_event = asyncio.Event()
 
         self.agent_capabilities: protocol.AgentCapabilities = {
@@ -293,7 +297,33 @@ class Agent(AgentBase):
         assert self._transport is not None, "Transport should be present here"
 
         self.log(f"[client] {request.body}")
+        # Track id-bearing calls so their futures can be failed if the
+        # transport drops before the response arrives.
+        for call in request._calls:
+            if call.id is not None and not call.future.done():
+                self._pending_calls.add(call)
         self._transport.write(b"%s\n" % request.body_json)
+
+    def _cancel_pending_calls(self, reason: str) -> None:
+        """Fail every outstanding :class:`MethodCall` future with ``reason``.
+
+        Called when the transport drops so any code ``await``-ing a response
+        (for example :meth:`acp_session_prompt`) wakes up promptly with an
+        :class:`jsonrpc.APIError` instead of hanging forever. After a
+        reconnect the agent server is a fresh instance and will not reply
+        to the old request IDs, so the in-flight futures must be released.
+        """
+        pending = list(self._pending_calls)
+        self._pending_calls.clear()
+        for call in pending:
+            if call.future.done():
+                continue
+            try:
+                call.future.set_exception(
+                    jsonrpc.APIError(-32000, reason, None)
+                )
+            except asyncio.InvalidStateError:
+                pass
 
     def request(self) -> jsonrpc.Request:
         """Create a request object."""
@@ -746,18 +776,17 @@ class Agent(AgentBase):
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
+    _REINIT_TIMEOUT_SECONDS: float = 30.0
+    """Upper bound on how long ``session/load`` and ``initialize`` may take
+    after a reconnect. Prevents a silent agent server from stalling the
+    reconnect sequence indefinitely."""
+
     async def _try_reconnect(self, transport: Transport) -> bool:
         """Attempt to reconnect the websocket transport and resume the session.
 
         Returns:
             True on success (transport is live and session resumed),
             False if all attempts are exhausted or resume is not possible.
-
-        TODO(remote-agent): in-flight ``MethodCall`` futures (e.g. an awaited
-        ``session/prompt``) are not cancelled when the transport drops. Their
-        awaiters hang until the user cancels manually. Track per-agent
-        pending requests and fail them with a connection-reset error on
-        reconnect before reissuing ``session/load``.
 
         TODO(remote-agent): once auto-reconnect gives up and posts
         ``AgentFail``, there is no UI affordance to retry without tearing
@@ -794,15 +823,37 @@ class Agent(AgentBase):
                 self.log(f"[reconnect] attempt {attempt} connect failed: {error}")
                 continue
 
+            # The reinit below awaits responses that arrive on the fresh
+            # transport, so we need something pumping `read_line()`. Spin up
+            # a short-lived reader task; the caller's outer loop takes over
+            # once we return.
+            pump_task = asyncio.create_task(self._read_loop(transport))
             try:
-                await self.acp_initialize()
-                await self.acp_load_session()
-            except Exception as error:
-                self.log(
-                    f"[reconnect] attempt {attempt} session resume failed: {error}"
-                )
-                # Next attempt's reconnect() will tear down and retry.
-                continue
+                try:
+                    await asyncio.wait_for(
+                        self.acp_initialize(),
+                        timeout=self._REINIT_TIMEOUT_SECONDS,
+                    )
+                    await asyncio.wait_for(
+                        self.acp_load_session(),
+                        timeout=self._REINIT_TIMEOUT_SECONDS,
+                    )
+                except Exception as error:
+                    self.log(
+                        f"[reconnect] attempt {attempt} session resume failed: "
+                        f"{error}"
+                    )
+                    # Drop orphaned reinit MethodCall futures so they cannot
+                    # resolve against a stale request id after the next
+                    # attempt opens yet another fresh connection.
+                    self._cancel_pending_calls(
+                        "Reconnect session resume failed"
+                    )
+                    continue
+            finally:
+                pump_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await pump_task
 
             self.post_message(AgentReconnected(attempt))
             return True
@@ -834,6 +885,11 @@ class Agent(AgentBase):
 
         while True:
             await self._read_loop(transport)
+
+            # Transport just died. Wake up anyone ``await``-ing a response
+            # (their request will never be answered on a replacement
+            # connection, if there even is one).
+            self._cancel_pending_calls("Agent connection reset")
 
             if self._stopping:
                 break
@@ -871,6 +927,10 @@ class Agent(AgentBase):
         if self._transport is not None:
             with suppress(Exception):
                 await self._transport.close()
+
+        # Release any awaiters still parked on in-flight requests so the
+        # conversation can shut down promptly.
+        self._cancel_pending_calls("Agent stopped")
 
     async def run(self) -> None:
         """The main logic of the Agent."""
