@@ -10,6 +10,8 @@ type AgentType = Literal["coding", "chat"]
 """The type of agent. More types TBD."""
 type AgentProtocol = Literal["acp"]
 """The protocol used to communicate with the agent. Currently only "acp" is supported."""
+type AgentTransport = Literal["stdio", "websocket"]
+"""Transport used to carry the ACP protocol. Defaults to 'stdio'."""
 
 
 class Command(TypedDict):
@@ -64,7 +66,16 @@ class Agent(TypedDict):
     """A Markdown document with additional details regarding the agent."""
     welcome: NotRequired[str]
     """A Markdown document shown to the user when the conversation starts. Should contain a welcome message and any advice on getting started."""
-    run_command: dict[OS, str]
-    """Command to run the agent, by OS or wildcard."""
+    run_command: NotRequired[dict[OS, str]]
+    """Command to run the agent, by OS or wildcard. Required when transport is 'stdio'."""
+    transport: NotRequired[AgentTransport]
+    """Transport carrying the ACP protocol. Defaults to 'stdio'."""
+    agent_endpoint: NotRequired[str]
+    """Endpoint URL to reach the remote agent (e.g. 'wss://agent.example.com/acp').
+    Required when transport is 'websocket'. Distinct from `url`, which is the
+    agent's homepage. Supports ${VAR} environment-variable substitution."""
+    headers: NotRequired[dict[str, str]]
+    """Extra HTTP headers sent on the WebSocket handshake (e.g. authentication).
+    Values support ${VAR} environment-variable substitution."""
     actions: dict[OS, dict[Action, Command]]
     """Scripts to perform actions, typically at least to install the agent."""

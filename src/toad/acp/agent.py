@@ -18,12 +18,24 @@ from textual.message_pump import MessagePump
 from toad import jsonrpc
 import toad
 from toad.agent_schema import Agent as AgentData
-from toad.agent import AgentBase, AgentReady, AgentFail
+from toad.agent import (
+    AgentBase,
+    AgentReady,
+    AgentFail,
+    AgentReconnecting,
+    AgentReconnected,
+)
 from toad.acp import protocol
 from toad.acp import api
 from toad.acp.api import API
 from toad.acp import messages
 from toad.acp.prompt import build as build_prompt
+from toad.acp.transport import (
+    EnvVarError,
+    StdioTransport,
+    Transport,
+    WebSocketTransport,
+)
 from toad.db import DB
 from toad import paths
 from toad import constants
@@ -69,6 +81,77 @@ def generate_datetime_filename(
 class Agent(AgentBase):
     """An agent that speaks the APC (https://agentclientprotocol.com/overview/introduction) protocol."""
 
+    _RECONNECT_MAX_ATTEMPTS: int = 3
+    """Maximum WebSocket reconnect attempts before giving up.
+
+    TODO(remote-agent): expose this (and `_RECONNECT_BACKOFF`) as an optional
+    field on the agent TOML schema so operators can tune retries without
+    patching source.
+    """
+    _RECONNECT_BACKOFF: tuple[float, ...] = (1.0, 2.0, 4.0)
+    """Per-attempt delay (seconds). The last value is reused if attempts exceed the tuple."""
+
+    # --- Terminal env var blocklist ----------------------------------------
+    # These names / patterns are silently stripped from any `env` an agent
+    # supplies to terminal/create. The block applies to all transports as
+    # defence-in-depth: a buggy local agent shouldn't smuggle `LD_PRELOAD`
+    # into a shell any more than a hostile remote one should.
+    _TERMINAL_ENV_BLOCKED_EXACT: frozenset[str] = frozenset(
+        {
+            # Executable search path (hijacks every subsequent command)
+            "PATH",
+            # Shell startup files auto-sourced by sh / bash
+            "BASH_ENV",
+            "ENV",
+            # Dynamic linker manipulation (Linux / macOS)
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "LD_AUDIT",
+            "LD_DEBUG",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+            "DYLD_FALLBACK_LIBRARY_PATH",
+            "DYLD_FORCE_FLAT_NAMESPACE",
+            # Language runtime hijacks
+            "PYTHONPATH",
+            "PYTHONSTARTUP",
+            "PYTHONHOME",
+            "NODE_OPTIONS",
+            "NODE_PATH",
+            "RUBYOPT",
+            "RUBYLIB",
+            "PERL5LIB",
+            "PERL5OPT",
+            # Outbound network redirection
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            # CA cert bundle override (enables trusted MITM)
+            "SSL_CERT_FILE",
+            "REQUESTS_CA_BUNDLE",
+            "CURL_CA_BUNDLE",
+            "NODE_EXTRA_CA_CERTS",
+            # GCP credentials file pointer
+            "GOOGLE_APPLICATION_CREDENTIALS",
+        }
+    )
+    _TERMINAL_ENV_BLOCKED_PREFIXES: tuple[str, ...] = (
+        "LD_",
+        "DYLD_",
+        # Cloud credential families
+        "AWS_",
+        "AZURE_",
+        "GCP_",
+    )
+    _TERMINAL_ENV_BLOCKED_SUFFIXES: tuple[str, ...] = (
+        "_SECRET",
+        "_TOKEN",
+        "_PASSWORD",
+        "_PRIVATE_KEY",
+        "_API_KEY",
+    )
+
     def __init__(
         self,
         project_root: Path,
@@ -92,7 +175,8 @@ class Agent(AgentBase):
 
         self._agent_task: asyncio.Task | None = None
         self._task: asyncio.Task | None = None
-        self._process: asyncio.subprocess.Process | None = None
+        self._transport: Transport | None = None
+        self._stopping: bool = False
         self.done_event = asyncio.Event()
 
         self.agent_capabilities: protocol.AgentCapabilities = {
@@ -119,10 +203,23 @@ class Agent(AgentBase):
             self._log_file_path = paths.get_log() / log_filename
 
     @property
+    def transport_kind(self) -> str:
+        """The transport carrying ACP for this agent ('stdio' or 'websocket')."""
+        return self._agent_data.get("transport", "stdio")
+
+    @property
     def command(self) -> str | None:
-        """The command used to launch the agent, or `None` if there isn't one."""
-        acp_command = toad.get_os_matrix(self._agent_data["run_command"])
-        return acp_command
+        """The command used to launch the agent, or `None` if there isn't one.
+
+        Only meaningful for the stdio transport; returns `None` for remote
+        (websocket) agents.
+        """
+        if self.transport_kind != "stdio":
+            return None
+        run_command = self._agent_data.get("run_command")
+        if not run_command:
+            return None
+        return toad.get_os_matrix(run_command)
 
     @property
     def supports_load_session(self) -> bool:
@@ -131,7 +228,11 @@ class Agent(AgentBase):
 
     def __rich_repr__(self) -> rich.repr.Result:
         yield self.project_root_path
-        yield self.command
+        yield "transport", self.transport_kind
+        if self.transport_kind == "websocket":
+            yield "agent_endpoint", self._agent_data.get("agent_endpoint")
+        else:
+            yield "command", self.command
 
     def log(self, line: str) -> None:
         """Write text to the agent log file.
@@ -189,11 +290,10 @@ class Agent(AgentBase):
             request: JSONRPC request object.
 
         """
-        assert self._process is not None, "Process should be present here"
+        assert self._transport is not None, "Transport should be present here"
 
         self.log(f"[client] {request.body}")
-        if (stdin := self._process.stdin) is not None:
-            stdin.write(b"%s\n" % request.body_json)
+        self._transport.write(b"%s\n" % request.body_json)
 
     def request(self) -> jsonrpc.Request:
         """Create a request object."""
@@ -347,6 +447,29 @@ class Agent(AgentBase):
         }
         return result
 
+    def _resolve_project_path(self, path: str) -> Path:
+        """Resolve ``path`` inside the project root, rejecting traversal.
+
+        The agent-supplied ``path`` is joined under :attr:`project_root_path`
+        and canonicalised via :meth:`Path.resolve`, which normalises ``..``
+        components and follows symlinks. The result must be contained within
+        the resolved project root; otherwise a JSON-RPC error is raised so
+        the agent cannot read or write files outside the workspace.
+
+        This guard applies uniformly to every transport — including local
+        stdio agents — because it is cheap and defence-in-depth: a trusted
+        local agent that mishandles a user-supplied relative path still gets
+        protected.
+        """
+        project_root = self.project_root_path.resolve()
+        candidate = (self.project_root_path / path).resolve()
+        if not candidate.is_relative_to(project_root):
+            raise jsonrpc.JSONRPCError(
+                f"Path {path!r} is outside the project root",
+                code=jsonrpc.ErrorCode.INVALID_PARAMS,
+            )
+        return candidate
+
     @jsonrpc.expose("fs/read_text_file")
     def rpc_read_text_file(
         self,
@@ -355,10 +478,11 @@ class Agent(AgentBase):
         line: int | None = None,
         limit: int | None = None,
     ) -> dict[str, str]:
-        """Read a file in the project."""
-        # TODO: what if the read is outside of the project path?
-        # https://agentclientprotocol.com/protocol/file-system#reading-files
-        read_path = self.project_root_path / path
+        """Read a file in the project.
+
+        https://agentclientprotocol.com/protocol/file-system#reading-files
+        """
+        read_path = self._resolve_project_path(path)
         try:
             text = read_path.read_text(encoding="utf-8", errors="ignore")
         except IOError:
@@ -373,11 +497,47 @@ class Agent(AgentBase):
 
     @jsonrpc.expose("fs/write_text_file")
     def rpc_write_text_file(self, sessionId: str, path: str, content: str) -> None:
-        # TODO: What if the agent wants to write outside of the project path?
-        # https://agentclientprotocol.com/protocol/file-system#writing-files
+        """Write a file in the project.
 
-        write_path = self.project_root_path / path
+        https://agentclientprotocol.com/protocol/file-system#writing-files
+        """
+        write_path = self._resolve_project_path(path)
         write_path.write_text(content, encoding="utf-8", errors="ignore")
+
+    def _filter_terminal_env(self, env: dict[str, str]) -> dict[str, str]:
+        """Strip high-risk env vars an agent tries to inject into a shell.
+
+        Blocks loader hijacks (``LD_*`` / ``DYLD_*``), interpreter hijacks
+        (``PYTHONPATH`` / ``NODE_OPTIONS`` / ...), shell rc files
+        (``BASH_ENV``), proxy / CA bundle redirection, and cloud-credential
+        families (``AWS_*`` / ``*_TOKEN`` / ``*_SECRET`` / ...). Rejected
+        entries are written to the agent log so the block is debuggable.
+
+        Applied uniformly to stdio and websocket transports — a local
+        agent should not need these either; if one legitimately does, it
+        can pass them through its own launch environment instead of the
+        ACP ``env`` field.
+        """
+        cleaned: dict[str, str] = {}
+        for name, value in env.items():
+            upper = name.upper()
+            if upper in self._TERMINAL_ENV_BLOCKED_EXACT:
+                self.log(f"[security] blocked agent env (exact match): {name}")
+                continue
+            if any(
+                upper.startswith(prefix)
+                for prefix in self._TERMINAL_ENV_BLOCKED_PREFIXES
+            ):
+                self.log(f"[security] blocked agent env (prefix): {name}")
+                continue
+            if any(
+                upper.endswith(suffix)
+                for suffix in self._TERMINAL_ENV_BLOCKED_SUFFIXES
+            ):
+                self.log(f"[security] blocked agent env (suffix): {name}")
+                continue
+            cleaned[name] = value
+        return cleaned
 
     # https://agentclientprotocol.com/protocol/schema#createterminalrequest
     @jsonrpc.expose("terminal/create")
@@ -395,9 +555,10 @@ class Agent(AgentBase):
         self._terminal_count = self._terminal_count + 1
         terminal_id = f"terminal-{self._terminal_count}"
 
-        terminal_env = (
+        raw_env = (
             {variable["name"]: variable["value"] for variable in env} if env else {}
         )
+        terminal_env = self._filter_terminal_env(raw_env)
         result_future: asyncio.Future[bool] = asyncio.Future()
         self.post_message(
             messages.CreateTerminal(
@@ -469,125 +630,247 @@ class Agent(AgentBase):
         return_code, signal = result_future.result()
         return {"exitCode": return_code, "signal": signal}
 
-    async def _run_agent(self) -> None:
-        """Task to communicate with the agent subprocess."""
-
-        PIPE = asyncio.subprocess.PIPE
-        env = os.environ.copy()
-        env["TOAD_CWD"] = str(Path("./").absolute())
-
-        if (command := self.command) is None:
+    async def _open_stdio_transport(self) -> StdioTransport | None:
+        """Open a stdio transport; post AgentFail and return None on error."""
+        command = self.command
+        if command is None:
             self.post_message(
                 AgentFail("Failed to start agent; no run command for this OS")
             )
-            return
+            return None
+        env = os.environ.copy()
+        env["TOAD_CWD"] = str(Path("./").absolute())
         try:
-            process = self._process = await asyncio.create_subprocess_shell(
+            return await StdioTransport.connect(
                 command,
-                stdin=PIPE,
-                stdout=PIPE,
-                stderr=PIPE,
+                cwd=self.project_root_path,
                 env=env,
-                cwd=str(self.project_root_path),
-                limit=10 * 1024 * 1024,
             )
         except Exception as error:
             self.post_message(AgentFail("Failed to start agent", details=str(error)))
-            return
+            return None
 
-        self._task = asyncio.create_task(self.run())
+    async def _open_websocket_transport(self) -> WebSocketTransport | None:
+        """Open a websocket transport; post AgentFail and return None on error."""
+        endpoint = self._agent_data.get("agent_endpoint")
+        if not endpoint:
+            self.post_message(
+                AgentFail(
+                    "Failed to start agent",
+                    details="websocket transport requires an 'agent_endpoint' field",
+                )
+            )
+            return None
+        headers = self._agent_data.get("headers") or {}
+        try:
+            return await WebSocketTransport.connect(endpoint, headers=headers)
+        except EnvVarError as error:
+            self.post_message(
+                AgentFail(
+                    "Failed to start agent",
+                    details=str(error),
+                )
+            )
+            return None
+        except Exception as error:
+            self.post_message(
+                AgentFail(
+                    "Failed to connect to remote agent",
+                    details=str(error),
+                )
+            )
+            return None
 
-        assert process.stdout is not None
-        assert process.stdin is not None
+    async def _read_loop(self, transport: Transport) -> None:
+        """Read newline-delimited JSON-RPC frames from the transport until EOF.
 
+        Dispatches method calls on this Agent's RPC server and routes responses
+        back through the :data:`API` singleton.
+        """
         tasks: set[asyncio.Task] = set()
 
         async def call_jsonrpc(request: jsonrpc.JSONObject | jsonrpc.JSONList) -> None:
             try:
                 if (result := await self.server.call(request)) is not None:
                     result_json = json.dumps(result).encode("utf-8")
-                    if process.stdin is not None:
-                        process.stdin.write(b"%s\n" % result_json)
+                    transport.write(b"%s\n" % result_json)
             finally:
                 if (task := asyncio.current_task()) is not None:
                     tasks.discard(task)
 
-        while line := await process.stdout.readline():
-            # This line should contain JSON, which may be:
-            #   A) a JSONRPC request
-            #   B) a JSONRPC response to a previous request
-            if not line.strip():
+        try:
+            while line := await transport.read_line():
+                if not line.strip():
+                    continue
+
+                try:
+                    line_str = line.decode("utf-8")
+                except Exception as error:
+                    self.log(f"[error] Unable to decode utf-8 from agent: {error}")
+                    continue
+
+                self.log(f"[agent] {line_str}")
+                try:
+                    agent_data: jsonrpc.JSONType = json.loads(line_str)
+                except Exception as error:
+                    self.log(f"[error] failed to decode JSON from agent: {error}")
+                    continue
+
+                if isinstance(agent_data, dict):
+                    if "result" in agent_data or "error" in agent_data:
+                        API.process_response(agent_data)
+                        continue
+
+                elif isinstance(agent_data, list):
+                    if not all(isinstance(datum, dict) for datum in agent_data):
+                        self.log(f"[error] Agent sent invalid data: {agent_data!r}")
+                        continue
+                    if all(
+                        isinstance(datum, dict)
+                        and ("result" in datum or "error" in datum)
+                        for datum in agent_data
+                    ):
+                        API.process_response(agent_data)
+                        continue
+
+                if not isinstance(agent_data, dict):
+                    self.log("[error] Invalid JSON from agent {agent_data!r}")
+                    continue
+
+                assert isinstance(agent_data, dict)
+                tasks.add(asyncio.create_task(call_jsonrpc(agent_data)))
+                await asyncio.sleep(0)
+        finally:
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _try_reconnect(self, transport: Transport) -> bool:
+        """Attempt to reconnect the websocket transport and resume the session.
+
+        Returns:
+            True on success (transport is live and session resumed),
+            False if all attempts are exhausted or resume is not possible.
+
+        TODO(remote-agent): in-flight ``MethodCall`` futures (e.g. an awaited
+        ``session/prompt``) are not cancelled when the transport drops. Their
+        awaiters hang until the user cancels manually. Track per-agent
+        pending requests and fail them with a connection-reset error on
+        reconnect before reissuing ``session/load``.
+
+        TODO(remote-agent): once auto-reconnect gives up and posts
+        ``AgentFail``, there is no UI affordance to retry without tearing
+        down the conversation. Expose a public ``Agent.try_reconnect()``
+        entry point and wire a "reconnect" action into the conversation
+        widget so users can recover without losing scrollback.
+        """
+        if not isinstance(transport, WebSocketTransport):
+            return False
+        if self._stopping:
+            return False
+        if not self.supports_load_session or self.session_id is None:
+            # Without session resume we can't transparently reattach.
+            return False
+
+        for attempt in range(1, self._RECONNECT_MAX_ATTEMPTS + 1):
+            delay = self._RECONNECT_BACKOFF[
+                min(attempt - 1, len(self._RECONNECT_BACKOFF) - 1)
+            ]
+            self.post_message(
+                AgentReconnecting(attempt, self._RECONNECT_MAX_ATTEMPTS, delay)
+            )
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                raise
+
+            if self._stopping:
+                return False
+
+            try:
+                await transport.reconnect()
+            except Exception as error:
+                self.log(f"[reconnect] attempt {attempt} connect failed: {error}")
                 continue
 
             try:
-                line_str = line.decode("utf-8")
+                await self.acp_initialize()
+                await self.acp_load_session()
             except Exception as error:
-                self.log(f"[error] Unable to decode utf-8 from agent: {error}")
+                self.log(
+                    f"[reconnect] attempt {attempt} session resume failed: {error}"
+                )
+                # Next attempt's reconnect() will tear down and retry.
                 continue
 
-            self.log(f"[agent] {line_str}")
-            try:
-                agent_data: jsonrpc.JSONType = json.loads(line_str)
-            except Exception as error:
-                self.log(f"[error] failed to decode JSON from agent: {error}")
-                continue
+            self.post_message(AgentReconnected(attempt))
+            return True
 
-            if isinstance(agent_data, dict):
-                if "result" in agent_data or "error" in agent_data:
-                    API.process_response(agent_data)
-                    continue
+        return False
 
-            elif isinstance(agent_data, list):
-                if not all(isinstance(datum, dict) for datum in agent_data):
-                    self.log(f"[error] Agent sent invalid data: {agent_data!r}")
-                    continue
-                if all(
-                    isinstance(datum, dict) and ("result" in datum or "error" in datum)
-                    for datum in agent_data
-                ):
-                    API.process_response(agent_data)
-                    continue
+    async def _run_agent(self) -> None:
+        """Task to communicate with the agent over the configured transport."""
 
-            if not isinstance(agent_data, dict):
-                self.log("[error] Invalid JSON from agent {agent_data!r}")
-                continue
-
-            # By this point we know it is a JSON RPC call
-            assert isinstance(agent_data, dict)
-            tasks.add(asyncio.create_task(call_jsonrpc(agent_data)))
-            await asyncio.sleep(0)
-
-        # Cancel all remaining tasks and wait for them to finish
-        for task in tasks:
-            task.cancel()
-
-        # Wait for all tasks to complete cancellation
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-        if process.returncode:
-            assert process.stderr is not None
-            fail_details = (await process.stderr.read()).decode("utf-8", "replace")
+        transport_kind = self.transport_kind
+        if transport_kind == "stdio":
+            transport = await self._open_stdio_transport()
+        elif transport_kind == "websocket":
+            transport = await self._open_websocket_transport()
+        else:
             self.post_message(
                 AgentFail(
-                    f"Agent returned a failure code: [b]{process.returncode}",
+                    "Failed to start agent",
+                    details=f"Unknown transport: {transport_kind!r}",
+                )
+            )
+            return
+
+        if transport is None:
+            return
+
+        self._transport = transport
+        self._task = asyncio.create_task(self.run())
+
+        while True:
+            await self._read_loop(transport)
+
+            if self._stopping:
+                break
+
+            if not await self._try_reconnect(transport):
+                break
+            # Reconnected — re-enter the read loop with the live transport.
+
+        exit_code = transport.exit_code
+        if exit_code:
+            fail_details = await transport.failure_details()
+            self.post_message(
+                AgentFail(
+                    f"Agent returned a failure code: [b]{exit_code}",
+                    details=fail_details,
+                )
+            )
+        elif not self._stopping and (fail_details := await transport.failure_details()):
+            self.post_message(
+                AgentFail(
+                    "Agent connection lost",
                     details=fail_details,
                 )
             )
 
-        self._process = None
+        self._transport = None
 
     async def stop(self) -> None:
-        """Gracefully stop the process."""
+        """Gracefully stop the agent transport."""
+        self._stopping = True
         if self.session_pk is not None:
             db = DB()
             await db.session_update_last_used(self.session_pk)
 
-        if self._process is not None:
-            try:
-                self._process.terminate()
-            except OSError:
-                pass
+        if self._transport is not None:
+            with suppress(Exception):
+                await self._transport.close()
 
     async def run(self) -> None:
         """The main logic of the Agent."""
