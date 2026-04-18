@@ -109,6 +109,15 @@ Try updating to see if support has been added.
 
 If that fails, ask for help in [Discussions](https://github.com/batrachianai/toad/discussions)!
 """,
+    "disconnected": """\
+## Agent disconnected
+
+The connection to the agent dropped and all automatic reconnect
+attempts were exhausted.
+
+- Run `/toad:reconnect` to try again when the agent is back
+- Or `/toad:session-close` to close this session and start fresh
+""",
 }
 
 HELP_URL = "https://github.com/batrachianai/toad/discussions"
@@ -1434,6 +1443,10 @@ class Conversation(containers.Vertical):
                 "<initial prompt or command>",
             ),
             SlashCommand(
+                "/toad:reconnect",
+                "Reconnect to the agent after a disconnect",
+            ),
+            SlashCommand(
                 "/toad:testimonial",
                 "Tweet a testimonial regarding Toad",
                 "<what you think of toad>",
@@ -2017,6 +2030,27 @@ class Conversation(containers.Vertical):
                     )
                 )
                 return True
+        elif command == "toad:reconnect":
+            from toad.acp.agent import Agent as ACPAgent
+
+            if not isinstance(self.agent, ACPAgent):
+                self.notify(
+                    "This session has no ACP agent to reconnect to.",
+                    title="/toad:reconnect",
+                    severity="warning",
+                )
+                return True
+            started, reason = await self.agent.try_reconnect()
+            if started:
+                self.flash("Reconnecting…", style="warning")
+                self._agent_fail = False
+            else:
+                self.notify(
+                    reason or "Unable to reconnect",
+                    title="/toad:reconnect",
+                    severity="warning",
+                )
+            return True
         elif command == "toad:testimonial":
             if self.agent_title is not None:
                 default_testimonial = (

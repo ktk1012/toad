@@ -912,10 +912,46 @@ class Agent(AgentBase):
                 AgentFail(
                     "Agent connection lost",
                     details=fail_details,
+                    help="disconnected",
                 )
             )
 
         self._transport = None
+
+    async def try_reconnect(self) -> tuple[bool, str | None]:
+        """Attempt to restart the transport after an :class:`AgentFail`.
+
+        Intended for user-initiated recovery (e.g. a ``/toad:reconnect``
+        slash command) once the automatic backoff sequence has given up.
+        A fresh ``_run_agent`` task is spawned, which will open a new
+        transport, run :meth:`acp_initialize`, and call
+        :meth:`acp_load_session` if a session id is available.
+
+        Returns:
+            ``(True, None)`` if a new agent task was started. The caller
+            should watch for :class:`AgentReady` / :class:`AgentFail` to
+            learn the outcome.
+            ``(False, reason)`` if preconditions weren't met.
+        """
+        if self._stopping:
+            return False, "Agent is shutting down"
+        if self._agent_task is not None and not self._agent_task.done():
+            return False, "Agent is already connecting"
+        # Session resume requires both a session id and a server that
+        # understands session/load. Without both, reconnecting would
+        # silently drop the existing conversation context; make the
+        # user explicitly close and start a new session instead.
+        if self.session_id is None:
+            return False, "No session to resume; start a new session instead"
+        if not self.supports_load_session:
+            return False, (
+                f"{self._agent_data['name']} does not support resuming sessions"
+            )
+
+        self._transport = None
+        self._pending_calls.clear()
+        self._agent_task = asyncio.create_task(self._run_agent())
+        return True, None
 
     async def stop(self) -> None:
         """Gracefully stop the agent transport."""
