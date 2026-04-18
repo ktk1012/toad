@@ -43,7 +43,13 @@ from toad.app import ToadApp
 from toad.acp import protocol as acp_protocol
 from toad.acp.agent import Mode
 from toad.answer import Answer
-from toad.agent import AgentBase, AgentReady, AgentFail
+from toad.agent import (
+    AgentBase,
+    AgentReady,
+    AgentFail,
+    AgentReconnecting,
+    AgentReconnected,
+)
 from toad.format_path import format_path
 from toad.directory_watcher import DirectoryWatcher, DirectoryChanged
 from toad.history import History
@@ -773,6 +779,27 @@ class Conversation(containers.Vertical):
             help = AGENT_FAIL_HELP["fail"]
 
         await self.post(MarkdownNote(help))
+
+    @on(AgentReconnecting)
+    def on_agent_reconnecting(self, message: AgentReconnecting) -> None:
+        # Show a warning flash for at least the backoff window so the user
+        # sees why the agent has gone quiet. Duration is clamped so very
+        # short delays still surface visibly.
+        content = Content.assemble(
+            "Reconnecting ",
+            Content.styled(
+                f"({message.attempt}/{message.max_attempts})", "dim"
+            ),
+            f" — retrying in {message.delay:.0f}s",
+        )
+        self.flash(content, style="warning", duration=max(message.delay + 2, 3))
+
+    @on(AgentReconnected)
+    def on_agent_reconnected(self, message: AgentReconnected) -> None:
+        self.flash(
+            f"Reconnected (attempt {message.attempt})",
+            style="success",
+        )
 
     @on(messages.WorkStarted)
     def on_work_started(self) -> None:
