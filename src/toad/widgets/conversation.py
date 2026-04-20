@@ -1099,10 +1099,10 @@ class Conversation(containers.Vertical):
         args: list[str] | None,
         cwd: str | None,
     ) -> bool:
-        """Ask the user to approve a terminal command from a remote agent.
+        """Ask the user to approve a terminal command from an untrusted agent.
 
         Returns True if the user selects an "allow" option, False otherwise.
-        Only invoked for agents whose transport is not trusted-local (stdio).
+        Only invoked for agents whose ``trust_level`` is ``untrusted``.
         """
         import shlex
 
@@ -1147,13 +1147,12 @@ class Conversation(containers.Vertical):
     async def on_acp_create_terminal(self, message: acp_messages.CreateTerminal):
         from toad.widgets.terminal_tool import TerminalTool, Command
 
-        # Security gate: remote (non-stdio) agents must get explicit user
-        # consent before executing arbitrary shell commands. Local stdio
-        # agents retain the existing behaviour — they are launched by the
-        # user from a binary on their own machine and are considered
-        # trusted to the same degree as the user's own process.
-        transport_kind = getattr(self.agent, "transport_kind", "stdio")
-        if transport_kind != "stdio":
+        # Security gate: untrusted agents must get explicit user consent
+        # before executing arbitrary shell commands. Trust defaults from
+        # the transport (stdio = trusted, websocket = untrusted) but can
+        # be overridden per-agent via `trust_level` in the TOML.
+        trust_level = getattr(self.agent, "trust_level", "trusted")
+        if trust_level != "trusted":
             allowed = await self._confirm_remote_terminal(
                 message.command, message.args, message.cwd
             )
