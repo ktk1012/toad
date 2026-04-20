@@ -12,6 +12,11 @@ type AgentProtocol = Literal["acp"]
 """The protocol used to communicate with the agent. Currently only "acp" is supported."""
 type AgentTransport = Literal["stdio", "websocket"]
 """Transport used to carry the ACP protocol. Defaults to 'stdio'."""
+type AgentTrustLevel = Literal["trusted", "untrusted"]
+"""How much the client trusts the agent. `trusted` agents run terminal
+commands without per-call confirmation; `untrusted` agents must get
+explicit user approval for each shell invocation. Defaults depend on
+transport: stdio agents are trusted, websocket agents are untrusted."""
 
 
 class Command(TypedDict):
@@ -77,5 +82,10 @@ class Agent(TypedDict):
     headers: NotRequired[dict[str, str]]
     """Extra HTTP headers sent on the WebSocket handshake (e.g. authentication).
     Values support ${VAR} environment-variable substitution."""
+    trust_level: NotRequired[AgentTrustLevel]
+    """Explicit trust level for this agent. If omitted, the default is
+    derived from `transport`: stdio -> 'trusted', websocket -> 'untrusted'.
+    Set explicitly to override (e.g. a self-hosted websocket agent you
+    operate yourself can be marked 'trusted')."""
     actions: dict[OS, dict[Action, Command]]
     """Scripts to perform actions, typically at least to install the agent."""

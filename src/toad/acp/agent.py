@@ -212,6 +212,21 @@ class Agent(AgentBase):
         return self._agent_data.get("transport", "stdio")
 
     @property
+    def trust_level(self) -> str:
+        """Effective trust level: 'trusted' or 'untrusted'.
+
+        An explicit ``trust_level`` entry in the agent TOML wins. Otherwise
+        stdio agents default to ``trusted`` (they are launched from a binary
+        on the user's machine and share the user's process boundary) and
+        websocket agents default to ``untrusted`` (they run elsewhere and
+        the connection alone does not imply authorisation).
+        """
+        explicit = self._agent_data.get("trust_level")
+        if explicit in ("trusted", "untrusted"):
+            return explicit
+        return "trusted" if self.transport_kind == "stdio" else "untrusted"
+
+    @property
     def command(self) -> str | None:
         """The command used to launch the agent, or `None` if there isn't one.
 
