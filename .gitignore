@@ -17,6 +17,11 @@ __pycache__
 *.github
 *.log
 
+# Nix / direnv
+.direnv/
+result
+result-*
+
 uv.lock
 agent.jsonl
 replay.jsonl
