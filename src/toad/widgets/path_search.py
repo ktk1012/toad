@@ -41,7 +41,6 @@ from toad._path_match import match_path
 
 
 class PathContent(Content):
-
     def render_strips(
         self, width: int, height: int | None, style: Style, options: RenderOptions
     ) -> list[Strip]:
@@ -129,7 +128,6 @@ The search is *fuzzy*, and will match characters that aren't neccesarily next to
 
 
 class PathSearch(containers.VerticalGroup):
-
     BINDING_GROUP_TITLE = "Path search"
 
     CURSOR_BINDING_GROUP = Binding.Group(description="Move selection")
@@ -170,7 +168,7 @@ class PathSearch(containers.VerticalGroup):
         self.set_reactive(PathSearch.root, root)
         self.root = root
         self.fuzzy_index = FuzzyIndex()
-        self.pool = concurrent.futures.InterpreterPoolExecutor(
+        self.pool = concurrent.futures.ThreadPoolExecutor(
             thread_name_prefix=f"fuzzy-path-search-{root}"
         )
         self.search_cache: LRUCache[str, list[tuple[float, Sequence[int], str]]] = (
