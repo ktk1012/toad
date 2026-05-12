@@ -357,6 +357,32 @@ class Agent(AgentBase):
             return False
         return message_target.post_message(message)
 
+    @staticmethod
+    def _format_token_count(count: int) -> str:
+        abs_count = abs(count)
+        for factor, suffix in ((1_000_000, "m"), (1_000, "k")):
+            if abs_count >= factor:
+                return f"{count / factor:.1f}{suffix}".replace(".0", "")
+        return str(count)
+
+    @staticmethod
+    def _format_usage_update_status_line(update: protocol.UsageUpdate) -> str:
+        used = update["used"]
+        size = update["size"]
+        percentage = round(used / size * 100) if size else 0
+        status_line = (
+            f"Context {Agent._format_token_count(used)} / "
+            f"{Agent._format_token_count(size)} ({percentage}%)"
+        )
+        if cost := update.get("cost"):
+            amount = cost["amount"]
+            currency = cost["currency"]
+            if currency == "USD":
+                status_line += f" · ${amount:.2f}"
+            else:
+                status_line += f" · {amount:.2f} {currency}"
+        return status_line
+
     @jsonrpc.expose("session/update")
     def rpc_session_update(
         self,
@@ -442,6 +468,11 @@ class Agent(AgentBase):
 
             case {"sessionUpdate": "current_mode_update", "currentModeId": mode_id}:
                 self.post_message(messages.ModeUpdate(mode_id))
+
+            case {"sessionUpdate": "usage_update", "used": int(), "size": int()}:
+                status_line = self._format_usage_update_status_line(
+                    cast(protocol.UsageUpdate, update)
+                )
 
         if status_line is not None:
             self.post_message(messages.UpdateStatusLine(status_line))

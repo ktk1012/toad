@@ -308,6 +308,18 @@ class CurrentModeUpdate(SchemaDict, total=False):
     sessionUpdate: Required[Literal["current_mode_update"]]
 
 
+class UsageCost(SchemaDict, total=False):
+    amount: Required[float]
+    currency: Required[str]
+
+
+class UsageUpdate(SchemaDict, total=False):
+    cost: UsageCost
+    sessionUpdate: Required[Literal["usage_update"]]
+    size: Required[int]
+    used: Required[int]
+
+
 type SessionUpdate = (
     UserMessageChunk
     | AgentMessageChunk
@@ -317,6 +329,7 @@ type SessionUpdate = (
     | Plan
     | AvailableCommandsUpdate
     | CurrentModeUpdate
+    | UsageUpdate
 )
 
 
