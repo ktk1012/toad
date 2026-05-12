@@ -6,6 +6,7 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+import re
 from typing import Any, cast, NamedTuple
 from copy import deepcopy
 
@@ -366,15 +367,15 @@ class Agent(AgentBase):
         return str(count)
 
     @staticmethod
-    def _format_usage_update_status_line(update: protocol.UsageUpdate) -> str:
-        used = update["used"]
-        size = update["size"]
+    def _format_usage_status_line(
+        used: int, size: int, cost: protocol.UsageCost | None = None
+    ) -> str:
         percentage = round(used / size * 100) if size else 0
         status_line = (
             f"Context {Agent._format_token_count(used)} / "
             f"{Agent._format_token_count(size)} ({percentage}%)"
         )
-        if cost := update.get("cost"):
+        if cost:
             amount = cost["amount"]
             currency = cost["currency"]
             if currency == "USD":
@@ -382,6 +383,61 @@ class Agent(AgentBase):
             else:
                 status_line += f" · {amount:.2f} {currency}"
         return status_line
+
+    @staticmethod
+    def _format_usage_update_status_line(update: protocol.UsageUpdate) -> str:
+        return Agent._format_usage_status_line(
+            update["used"], update["size"], update.get("cost")
+        )
+
+    @staticmethod
+    def _parse_token_count(text: str) -> int | None:
+        match = re.fullmatch(r"\s*([\d,.]+)\s*([km]?)\s*", text, re.IGNORECASE)
+        if match is None:
+            return None
+        number_text, suffix = match.groups()
+        try:
+            number = float(number_text.replace(",", ""))
+        except ValueError:
+            return None
+        factor = {"k": 1_000, "m": 1_000_000}.get(suffix.lower(), 1)
+        return round(number * factor)
+
+    @staticmethod
+    def _parse_context_command_usage(text: str) -> tuple[int, int] | None:
+        if "Context Usage" not in text:
+            return None
+        match = re.search(
+            r"(?im)^Tokens:\s*([\d,.]+\s*[km]?)\s*/\s*([\d,.]+\s*[km]?)\s*\(\d+%\)",
+            text,
+        )
+        if match is None:
+            return None
+        used = Agent._parse_token_count(match.group(1))
+        size = Agent._parse_token_count(match.group(2))
+        if used is None or size is None:
+            return None
+        return used, size
+
+    def _remember_context_command_usage(self, text: str) -> str | None:
+        if usage := self._parse_context_command_usage(text):
+            self._last_context_command_usage = usage
+            used, size = usage
+            return self._format_usage_status_line(used, size)
+        return None
+
+    def _format_agent_usage_update_status_line(
+        self, update: protocol.UsageUpdate
+    ) -> str:
+        used = update["used"]
+        size = update["size"]
+        if context_usage := getattr(self, "_last_context_command_usage", None):
+            context_used, context_size = context_usage
+            if size < context_size:
+                size = context_size
+                if used == 0:
+                    used = context_used
+        return self._format_usage_status_line(used, size, update.get("cost"))
 
     @jsonrpc.expose("session/update")
     def rpc_session_update(
@@ -415,6 +471,8 @@ class Agent(AgentBase):
             }:
                 if text:
                     self.post_message(messages.Update(type, text))
+                    if context_status_line := self._remember_context_command_usage(text):
+                        status_line = context_status_line
 
             case {
                 "sessionUpdate": "agent_thought_chunk",
@@ -470,7 +528,7 @@ class Agent(AgentBase):
                 self.post_message(messages.ModeUpdate(mode_id))
 
             case {"sessionUpdate": "usage_update", "used": int(), "size": int()}:
-                status_line = self._format_usage_update_status_line(
+                status_line = self._format_agent_usage_update_status_line(
                     cast(protocol.UsageUpdate, update)
                 )
 
